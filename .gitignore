@@ -4,11 +4,12 @@ __pycache__/
 .pytest_cache/
 node_modules/
 
-# Generated/runtime artifacts stay in the repo intentionally (they are the
-# audit trail), but local scratch runs and browser traces are ignored:
-artifacts/executions/*.local/
-reports/*.local/
+# Generated runtime artifacts — not committed
+artifacts/
+reports/
+allure-results/
 test-results/
 .playwright-mcp/
+.mcp.json
 
 .DS_Store
