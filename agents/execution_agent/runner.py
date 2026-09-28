@@ -17,9 +17,12 @@ import json
 import re
 import sys
 import textwrap
+import traceback
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
+
+from playwright._impl._errors import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 PROJECT = Path(__file__).parent.parent.parent
 sys.path.insert(0, str(PROJECT))
@@ -43,7 +46,7 @@ _UA = (
 def _safe_count(page: Page, sel: str) -> int:
     try:
         return page.locator(sel).count()
-    except Exception:
+    except PlaywrightError:
         return 0
 
 
@@ -74,9 +77,8 @@ def _discover_plp(page: Page, search_term: str = "Sony Bravia TV") -> dict:
     page.locator("#nav-search-submit-button").click()
     try:
         page.wait_for_selector("[data-component-type='s-search-result']", timeout=20_000)
-    except Exception:
-        pass
-    page.wait_for_timeout(1500)
+    except PlaywrightTimeoutError:
+        print("  [warn] PLP results did not appear within 20s — locators may be incomplete")
     return {
         "result_cards":    "[data-component-type='s-search-result']",
         "first_result":    _first_working(
@@ -95,9 +97,10 @@ def _discover_pdp(page: Page) -> dict:
     try:
         page.locator("[data-component-type='s-search-result'] h2 a").first.click()
         page.wait_for_selector("#productTitle", timeout=20_000)
-    except Exception:
-        pass
-    page.wait_for_timeout(1500)
+    except PlaywrightTimeoutError:
+        print("  [warn] PDP did not load within 20s — locators may be incomplete")
+    except PlaywrightError as exc:
+        print(f"  [warn] PDP navigation error: {exc}")
     return {
         "product_title":   "#productTitle",
         "price":           _first_working(
@@ -513,10 +516,15 @@ def _step_to_code(step: dict, pages: list[str], test_data: dict) -> str:
         lines.append(f'        "{sid}", {step["action"]!r}, {step["expected_result"]!r}, "PASSED")')
 
     else:
-        lines.append(f'    # Step: {step["action"][:80]}')
-        lines.append(f'    page.wait_for_timeout(500)')
+        # Step action not matched by any rule — wait for DOM to be idle rather
+        # than using a magic sleep, and record as SKIPPED so it is visible in
+        # reports and the healing agent can flag it.
+        lines.append(f'    # UNMATCHED STEP — review and implement manually')
+        lines.append(f'    # Action: {step["action"][:80]}')
+        lines.append(f'    page.wait_for_load_state("domcontentloaded")')
         lines.append('    step_logger.record(')
-        lines.append(f'        "{sid}", {step["action"]!r}, {step["expected_result"]!r}, "PASSED")')
+        lines.append(f'        "{sid}", {step["action"]!r}, {step["expected_result"]!r}, "SKIPPED",')
+        lines.append(f'        actual_result="Step not yet implemented — add POM method and update this test")')
 
     return "\n".join(lines)
 
@@ -643,16 +651,20 @@ def run(spec_filter: Optional[str] = None) -> None:
             all_locs["checkout"] = _discover_checkout(page)
 
             browser.close()
+    except PlaywrightTimeoutError as exc:
+        print(f"\n  [ERROR] Locator discovery timed out: {exc}")
+        print("  Possible causes: site is slow, bot-detection triggered, or network issue.")
+        print("  Fix: retry, check your network, or run with --headed to debug.")
+        print("  Aborting — not generating POM files with unverified locators.\n")
+        sys.exit(1)
+    except PlaywrightError as exc:
+        print(f"\n  [ERROR] Browser error during discovery: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
     except Exception as exc:
-        print(f"  [warn] Browser discovery failed: {exc}")
-        print("  Using fallback locators...")
-        all_locs = {
-            "home":     {"search_bar": "#twotabsearchtextbox", "search_submit": "#nav-search-submit-button", "nav_bar": "#nav-main"},
-            "plp":      {"result_cards": "[data-component-type='s-search-result']", "first_result": "[data-component-type='s-search-result'] h2 a", "sort_dropdown": "#s-result-sort-select", "filter_section": "#s-refinements", "result_count": ".s-breadcrumb"},
-            "pdp":      {"product_title": "#productTitle", "price": ".a-price .a-offscreen", "add_to_cart": "#add-to-cart-button", "availability": "#availability", "product_images": "#imgTagWrapperId img"},
-            "cart":     {"cart_items": ".sc-list-item", "quantity_select": ".a-dropdown-container select", "delete_button": "input[value='Delete']", "subtotal": "#sc-subtotal-amount-activecart", "proceed_checkout": "#sc-buy-box-ptc-button"},
-            "checkout": {"email_input": "#ap_email", "continue_button": "input[name='continue']", "order_summary": "#orderSummarySection"},
-        }
+        print(f"\n  [ERROR] Unexpected error during discovery: {type(exc).__name__}: {exc}")
+        traceback.print_exc()
+        sys.exit(1)
 
     # --- Phase 2: generate shared POM files ---
     print("\nPhase 2: Generating Page Object Model files...")
@@ -672,7 +684,8 @@ def run(spec_filter: Optional[str] = None) -> None:
             print(f"  [OK]  {out.name}  ({len(spec.steps)} steps)")
             ok += 1
         except Exception as exc:
-            print(f"  [ERR] {spec_path.name}: {exc}")
+            print(f"  [ERR] {spec_path.name}: {type(exc).__name__}: {exc}")
+            traceback.print_exc()
 
     print(f"\n{'='*60}")
     print(f"Done. {ok}/{len(spec_files)} test files compiled.")

@@ -13,6 +13,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import traceback
 import subprocess
 import sys
 from pathlib import Path
@@ -24,6 +25,7 @@ sys.path.insert(0, str(PROJECT))
 from utils.config import EXECUTIONS_ROOT
 from utils.spec_parser import parse_spec_file
 from playwright.sync_api import sync_playwright, Page
+from playwright._impl._errors import Error as PlaywrightError, TimeoutError as PlaywrightTimeoutError
 
 PAGES_DIR = PROJECT / "pages"
 TESTS_DIR = PROJECT / "tests"
@@ -51,7 +53,7 @@ def _pom_locators(pom_file: Path) -> list[dict]:
 def _count(page: Page, selector: str) -> int:
     try:
         return page.locator(selector).count()
-    except Exception:
+    except PlaywrightError:
         return -1
 
 
@@ -135,7 +137,7 @@ def _discover_replacement(page: Page, broken_selector: str, action: str) -> tupl
                 try:
                     if page.locator(sel).is_visible():
                         return loc_str, sel
-                except Exception:
+                except PlaywrightError:
                     return loc_str, sel
 
         # Role-based (exact=True avoids strict-mode violations)
@@ -144,7 +146,7 @@ def _discover_replacement(page: Page, broken_selector: str, action: str) -> tupl
                 loc = page.get_by_role("button", name=name, exact=True)
                 if loc.count() == 1 and loc.is_visible():
                     return f'get_by_role("button", name="{name}", exact=True)', f"role:button:{name}"
-            except Exception:
+            except PlaywrightError:
                 pass
 
     return None
@@ -172,9 +174,8 @@ def _setup_page_state(page: Page, spec, step_idx: int) -> None:
         # Wait for the page to be interactive
         try:
             page.wait_for_load_state("domcontentloaded", timeout=15_000)
-            page.wait_for_timeout(1500)
-        except Exception:
-            pass
+        except PlaywrightTimeoutError:
+            print(f"  [warn] Page load timeout after navigating to {base_url}")
 
     if step_idx < 2:
         return
@@ -190,7 +191,7 @@ def _setup_page_state(page: Page, spec, step_idx: int) -> None:
                 if loc.count() > 0 and loc.first.is_visible():
                     loc.first.fill(str(value))
                     break
-            except Exception:
+            except PlaywrightError:
                 pass
 
 
@@ -339,8 +340,14 @@ def heal(exec_id: Optional[str] = None) -> int:
 
         try:
             _setup_page_state(page, spec, step_idx)
-        except Exception as exc:
-            print(f"  ERROR setting up page state: {exc}")
+        except PlaywrightTimeoutError as exc:
+            print(f"  ERROR: Page setup timed out — {exc}")
+            print("  Check network or try again (possible bot detection).")
+            browser.close()
+            return 1
+        except PlaywrightError as exc:
+            print(f"  ERROR: Browser error during page setup — {exc}")
+            traceback.print_exc()
             browser.close()
             return 1
 
